@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tile-align-api"
+version = "1.0.0"
+description = "Locate scanned tiles of a large-format drawing via declared pairwise translations"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy==2.4.6",
+    "pillow==13.0.0",
+    "fastapi==0.165.0",
+    "uvicorn[standard]==0.54.0",
+    "python-multipart==0.0.34",
+    "pydantic==2.14.4",
+]
+
+[project.optional-dependencies]
+test = ["pytest==9.2.0", "httpx==0.28.1"]
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:DeprecationWarning",
+]
