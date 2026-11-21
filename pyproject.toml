@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tile-align-api"
-version = "1.0.0"
-description = "Locate scanned tiles of a large-format drawing via declared pairwise translations"
+name = "dimension-recognize-api"
+version = "2.0.0"
+description = "Recognize dimension values on scanned drawings via pixel-level glyph matching"
 requires-python = ">=3.11"
 dependencies = [
     "numpy==2.4.6",

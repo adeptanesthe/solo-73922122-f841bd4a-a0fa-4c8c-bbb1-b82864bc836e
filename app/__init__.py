@@ -1,3 +1,3 @@
-"""Chunk alignment service for a scanned large-format drawing."""
+"""Dimension recognition service for scanned engineering drawings."""
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"

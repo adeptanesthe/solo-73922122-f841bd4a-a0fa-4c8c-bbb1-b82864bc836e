@@ -9,467 +9,311 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.demo_font import all_glyph_labels
 from tests.fixtures import (
-    DEFAULT_PLACES,
-    TRUE_OFFSETS,
+    HEIGHT,
+    default_spec,
+    glyph_samples,
     png_bytes,
     png_bytes_16bit,
     png_bytes_gray_alpha,
+    png_bytes_nonbinary,
     png_bytes_palette,
     png_bytes_rgb,
-    spec_for,
-    tile_set,
-    window,
+    render_text,
 )
 
 client = TestClient(app)
 
 
-def post(tiles, spec, filenames=None):
-    files = []
-    for idx, tile in enumerate(tiles):
-        names = filenames or [f"tile{idx}.png"] * len(tiles)
-        files.append(("images", (names[idx], png_bytes(tile), "image/png")))
-    return client.post("/align", files=files, data={"spec": json.dumps(spec)})
+def post(line, glyph_arrays, labels=None, spec=None):
+    samples = glyph_samples()
+    default_labels = list(samples.keys())
+    spec = spec or default_spec()
+    payload = dict(spec)
+    # Explicit labels follow the uploads; otherwise keep whatever the spec
+    # declares (default_spec already lists all 11 labels in upload order).
+    if labels is not None:
+        payload["glyph_labels"] = labels
+    else:
+        payload.setdefault("glyph_labels", default_labels)
+    files = [("line", ("line.png", png_bytes(line), "image/png"))]
+    for idx, arr in enumerate(glyph_arrays):
+        files.append(("glyphs", (f"glyph_{idx}.png", png_bytes(arr), "image/png")))
+    return client.post("/recognize", files=files, data={"spec": json.dumps(payload)})
 
 
-def test_health_and_docs():
+def default_glyphs(labels=None):
+    labels = labels or all_glyph_labels()
+    samples = glyph_samples()
+    return [samples[label] for label in labels]
+
+
+def test_health_docs_and_demo_endpoints():
     assert client.get("/health").json()["status"] == "ok"
     assert client.get("/docs").status_code == 200
-    schema = client.get("/openapi.json").json()
-    assert "/align" in schema["paths"]
+    assert "/recognize" in client.get("/openapi.json").json()["paths"]
+    assert client.get("/demo/line").headers["content-type"] == "image/png"
+    assert client.get("/demo/glyphs/5").headers["content-type"] == "image/png"
+    assert client.get("/demo/glyphs/dot").headers["content-type"] == "image/png"
+    assert client.get("/demo/glyphs/x").status_code == 404
+    spec = client.get("/demo/spec").json()
+    assert set(spec) == {"glyph_labels", "max_mismatch", "min_margin"}
 
 
-def test_aligned_three_tiles_chain():
-    tiles = tile_set()
-    spec = spec_for([(0, 1), (1, 2)])
-    r = post(tiles, spec)
+def test_entry_ready_clean_line():
+    line = render_text("12.50")
+    r = post(line, default_glyphs())
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["status"] == "aligned"
-    assert body["layout_unique"] is True
-    assert [p["image_id"] for p in body["positions"]] == [0, 1, 2]
-    assert (body["positions"][0]["x"], body["positions"][0]["y"]) == (0, 0)
-    assert (body["positions"][1]["x"], body["positions"][1]["y"]) == TRUE_OFFSETS[(0, 1)]
-    assert (body["positions"][2]["x"], body["positions"][2]["y"]) == (0, 450)
-    by_pair = {p["pair_id"]: p for p in body["pairs"]}
-    assert by_pair[0]["dx"] == 450 and by_pair[0]["dy"] == 0
-    assert by_pair[1]["dx"] == -450 and by_pair[1]["dy"] == 450
-    assert all(p["overlap_pixels"] >= spec["min_overlap_pixels"] for p in body["pairs"])
-    assert all(p["mean_abs_diff"] <= spec["max_mean_abs_diff"] for p in body["pairs"])
-    b = body["mosaic_bounds"]
-    assert (b["x_min"], b["y_min"], b["width"], b["height"]) == (0, 0, 1050, 1050)
+    assert body["status"] == "entry_ready"
+    assert body["review_reasons"] == []
+    assert body["search_truncated"] is False
+    best = body["candidates"][0]
+    assert best["raw_text"] == "12.50"
+    assert best["value"] == "12.5"
+    assert best["mismatches"] == 0
+    assert [c["char"] for c in best["chars"]] == list("12.50")
+    # Column ranges are half-open and ordered.
+    for prev, nxt in zip(best["chars"], best["chars"][1:]):
+        assert prev["end_col"] <= nxt["start_col"]
+        assert nxt["end_col"] > nxt["start_col"]
+    assert sum(c["mismatches"] for c in best["chars"]) == best["mismatches"]
+    # A runner-up, if present, is a distinct, strictly worse value.
+    if len(body["candidates"]) == 2:
+        assert body["candidates"][1]["value"] != "12.5"
+        assert body["candidates"][1]["mismatches"] > 0
 
 
-def test_aligned_with_cycle_and_noise():
-    tiles = tile_set(seed=3, noise_sigma=1.5)
-    spec = spec_for(
-        [(0, 1), (1, 2), (0, 2)],
-        radius=3,
-        min_overlap=20000,
-        max_mad=4.0,
-    )
-    r = post(tiles, spec)
+def test_stuck_line_with_defects_still_recognized():
+    line = render_text("12.50", stuck_after={0, 3}, flips=[(2, 4), (3, 9)])
+    r = post(line, default_glyphs(), spec=default_spec(max_mismatch=12, min_margin=3))
     body = r.json()
     assert r.status_code == 200, r.text
-    assert body["status"] == "aligned", body
-    assert [(p["x"], p["y"]) for p in body["positions"]] == [(0, 0), (450, 0), (0, 450)]
+    assert body["status"] == "entry_ready", body
+    assert body["candidates"][0]["raw_text"] == "12.50"
+    assert 0 < body["candidates"][0]["mismatches"] <= 12
 
 
-def test_disconnected_asks_for_rescan():
-    tiles = tile_set()
-    spec = spec_for([(0, 1)])  # tile 2 is not linked at all
-    r = post(tiles, spec)
+def test_mismatch_limit_exceeded_marks_review():
+    line = render_text("7", flips=[(r, 3) for r in range(HEIGHT)])  # 7 flipped pixels
+    r = post(line, default_glyphs(), spec=default_spec(max_mismatch=1, min_margin=3))
+    body = r.json()
+    assert body["status"] == "needs_review"
+    assert "mismatch_limit_exceeded" in body["review_reasons"]
+    assert body["candidates"]  # a reading exists, just too costly
+
+
+def test_small_margin_marks_review():
+    # An ambiguous glyph: erase the spine of "1" so several digits score close.
+    from app.demo_font import glyph_bitmap
+
+    bmp = glyph_bitmap("1").copy()
+    bmp[:, 2] = False
+    line = np.where(bmp, 0, 255).astype(np.uint8)
+    r = post(line, default_glyphs(), spec=default_spec(max_mismatch=100, min_margin=100))
+    body = r.json()
+    assert body["status"] == "needs_review"
+    assert "margin_too_small" in body["review_reasons"]
+    assert len(body["candidates"]) == 2
+
+
+def test_no_reading_marks_review():
+    # Nine separated single ink columns with only a dot sample available:
+    # dots alone are illegal and eight characters cannot cover nine runs.
+    dot1 = np.full((HEIGHT, 1), 0, dtype=np.uint8)
+    gap = np.full((HEIGHT, 1), 255, np.uint8)
+    parts = [gap]
+    for _ in range(9):
+        parts.extend([dot1, gap])
+    line = np.concatenate(parts, axis=1)
+    r = post(line, [dot1], labels=["."], spec={"glyph_labels": ["."], "max_mismatch": 50, "min_margin": 1})
+    body = r.json()
+    assert body["status"] == "needs_review"
+    assert body["review_reasons"] == ["no_reading"]
+    assert body["candidates"] == []
+
+
+def test_all_white_line_is_review_not_client_error():
+    line = np.full((HEIGHT, 10), 255, dtype=np.uint8)
+    r = post(line, default_glyphs())
     assert r.status_code == 200
     body = r.json()
-    assert body["status"] == "disconnected"
-    assert body["unreachable_image_ids"] == [2]
-    assert body["rescan_image_id"] == 2
-    assert body["positions"] is None
-
-
-def test_disconnected_picks_least_connected_tile():
-    # Tile 2 is placed as before; tile 3 is an extra crop that no pair mentions.
-    tiles = tile_set(places=DEFAULT_PLACES + [(700, 700, 300, 300)])
-    spec = {
-        "pairs": [
-            {"a": 0, "b": 1, "window": window((550, 0))},
-            {"a": 1, "b": 2, "window": window((-550, 550))},
-        ],
-        "min_overlap_pixels": 5000,
-        "max_mean_abs_diff": 4.0,
-    }
-    body = post(tiles, spec).json()
-    assert body["status"] == "disconnected"
-    assert body["unreachable_image_ids"] == [3]
-    assert body["rescan_image_id"] == 3
-
-
-def test_no_solution_when_threshold_impossible():
-    # Scanner noise makes even the true offset score > 0; demanding a perfect
-    # match therefore leaves no acceptable candidate for any pair.
-    tiles = tile_set(noise_sigma=1.5)
-    spec = {
-        "pairs": [
-            {"a": 0, "b": 1, "window": window((450, 0))},
-            {"a": 1, "b": 2, "window": window((-450, 450))},
-        ],
-        "min_overlap_pixels": 20000,
-        "max_mean_abs_diff": 0.0,
-    }
-    body = post(tiles, spec).json()
-    assert body["status"] == "no_solution"
-    assert {f["pair_id"] for f in body["failing_pairs"]} == {0, 1}
-    assert all(f["reason"] == "mean_abs_diff_too_high" for f in body["failing_pairs"])
-
-
-def test_no_solution_when_overlap_too_small():
-    tiles = tile_set()
-    spec = {
-        "pairs": [
-            {"a": 0, "b": 1, "window": window((450, 0))},
-            {"a": 1, "b": 2, "window": window((-450, 450))},
-        ],
-        # (0,1) overlaps by 150x600 and (1,2) by 150x150; require more than both.
-        "min_overlap_pixels": 100000,
-        "max_mean_abs_diff": 4.0,
-    }
-    body = post(tiles, spec).json()
-    assert body["status"] == "no_solution"
-    assert body["failing_pairs"][0]["reason"] == "insufficient_overlap"
-
-
-def test_no_solution_when_pair_constraints_contradict():
-    # Tiles 0 and 2 truly overlap at (0, 450).  Declaring (0,2) at (200, 450)
-    # instead still leaves a sizeable overlap; the pixels cannot match there,
-    # so the pair has no accepted candidate and the request is unsatisfiable.
-    tiles = tile_set()
-    spec = {
-        "pairs": [
-            {"a": 0, "b": 1, "window": window((450, 0), radius=0)},
-            {"a": 1, "b": 2, "window": window((-450, 450), radius=0)},
-            {"a": 0, "b": 2, "window": window((200, 450), radius=0)},
-        ],
-        "min_overlap_pixels": 20000,
-        "max_mean_abs_diff": 6.0,
-    }
-    body = post(tiles, spec).json()
-    assert body["status"] == "no_solution"
-    assert [f["pair_id"] for f in body["failing_pairs"]] == [2]
-    assert body["failing_pairs"][0]["reason"] == "mean_abs_diff_too_high"
-
-
-def test_ambiguous_blank_overlap():
-    # Constant tiles: on a flat field every offset in the window has MAD 0, so
-    # the relative position is not determined.  Tile 0 and 1 are equal-valued,
-    # tile 2 differs, so pair (1,2) pins the shift of 2 relative to 1.
-    blank_a = np.full((200, 200), 255, dtype=np.uint8)
-    blank_b = np.full((200, 200), 255, dtype=np.uint8)
-    blank_c = np.full((200, 200), 255, dtype=np.uint8)
-    tiles = [blank_a, blank_b, blank_c]
-    spec = {
-        "pairs": [
-            {
-                "a": 0,
-                "b": 1,
-                "window": {"dx_min": 100, "dx_max": 108, "dy_min": 0, "dy_max": 8},
-            },
-            {
-                "a": 1,
-                "b": 2,
-                "candidates": [[100, 0]],
-            },
-        ],
-        "min_overlap_pixels": 10000,
-        "max_mean_abs_diff": 0.0,
-    }
-    body = post(tiles, spec).json()
-    assert body["status"] == "ambiguous"
-    assert body["layout_unique"] is False
-    assert set(body["uncertain_image_ids"]) == {1, 2}
-    assert body["alternative_layouts"] and len(body["alternative_layouts"]) >= 2
-    xs = {tuple((p["x"], p["y"]) for p in layout) for layout in body["alternative_layouts"]}
-    assert len(xs) >= 2
-
-
-def test_no_solution_when_candidates_are_mutually_inconsistent():
-    # Constant tiles make every offset in every window pass, so each pair has
-    # candidates.  The three windows cannot, however, be satisfied at once:
-    # (0,1) forces dx_02 = dx_01 + dx_12 >= 200, while (0,2) only allows 0..8.
-    blank = np.full((300, 300), 128, dtype=np.uint8)
-    tiles = [blank, blank.copy(), blank.copy()]
-    spec = {
-        "pairs": [
-            {"a": 0, "b": 1, "window": {"dx_min": 100, "dx_max": 108, "dy_min": 0, "dy_max": 0}},
-            {"a": 1, "b": 2, "window": {"dx_min": 100, "dx_max": 108, "dy_min": 0, "dy_max": 0}},
-            {"a": 0, "b": 2, "window": {"dx_min": 0, "dx_max": 8, "dy_min": 0, "dy_max": 0}},
-        ],
-        "min_overlap_pixels": 1000,
-        "max_mean_abs_diff": 0.0,
-    }
-    body = post(tiles, spec).json()
-    assert body["status"] == "no_solution"
-    assert body["failing_pairs"] in (None, [])
-    assert body["pair_candidate_counts"] == [9, 9, 9]
-
-
-def test_ambiguous_reports_each_free_tile():
-    blank = np.full((300, 300), 128, dtype=np.uint8)
-    other = np.full((300, 300), 128, dtype=np.uint8)
-    tiles = [blank, other, np.full((300, 300), 128, dtype=np.uint8)]
-    spec = {
-        "pairs": [
-            {"a": 0, "b": 1, "candidates": [[150, 0], [160, 0]]},
-            {"a": 1, "b": 2, "candidates": [[0, 150]]},
-        ],
-        "min_overlap_pixels": 1000,
-        "max_mean_abs_diff": 0.0,
-    }
-    body = post(tiles, spec).json()
-    assert body["status"] == "ambiguous"
-    # Tile 1's x is uncertain by 10 px, so tile 2 (rigidly attached) is too.
-    assert set(body["uncertain_image_ids"]) == {1, 2}
-
-
-def test_rejects_wrong_image_count():
-    tiles = tile_set()[:2]
-    spec = spec_for([(0, 1)])
-    r = post(tiles, spec)
-    assert r.status_code == 400
-    assert "3" in r.json()["detail"] or "张" in r.json()["detail"]
+    assert body["status"] == "needs_review"
+    assert "no_reading" in body["review_reasons"]
 
 
 def test_rejects_rgb_png():
-    tiles = tile_set()
-    files = [("images", (f"t{i}.png", png_bytes_rgb(t), "image/png")) for i, t in enumerate(tiles)]
-    r = client.post("/align", files=files, data={"spec": json.dumps(spec_for([(0, 1), (1, 2)]))})
+    line = render_text("1")
+    files = [("line", ("line.png", png_bytes_rgb(line), "image/png"))]
+    for idx, arr in enumerate(default_glyphs()):
+        files.append(("glyphs", (f"g{idx}.png", png_bytes(arr), "image/png")))
+    r = client.post(
+        "/recognize", files=files, data={"spec": json.dumps(default_spec())}
+    )
     assert r.status_code == 400
-    assert "灰度" in r.json()["detail"] or "颜色类型" in r.json()["detail"]
+    assert "颜色类型" in r.json()["detail"]
 
 
 def test_rejects_16bit_png():
-    tiles = tile_set()
-    files = [("images", (f"t{i}.png", png_bytes_16bit(t), "image/png")) for i, t in enumerate(tiles)]
-    r = client.post("/align", files=files, data={"spec": json.dumps(spec_for([(0, 1), (1, 2)]))})
+    line = render_text("1")
+    files = [("line", ("line.png", png_bytes_16bit(line), "image/png"))]
+    for idx, arr in enumerate(default_glyphs()):
+        files.append(("glyphs", (f"g{idx}.png", png_bytes(arr), "image/png")))
+    r = client.post("/recognize", files=files, data={"spec": json.dumps(default_spec())})
     assert r.status_code == 400
     assert "8 位" in r.json()["detail"]
 
 
-def test_rejects_palette_png():
-    tiles = tile_set()
-    files = [("images", (f"t{i}.png", png_bytes_palette(t), "image/png")) for i, t in enumerate(tiles)]
-    r = client.post("/align", files=files, data={"spec": json.dumps(spec_for([(0, 1), (1, 2)]))})
+def test_rejects_palette_and_alpha_png():
+    line = render_text("1")
+    for encoder, needle in (
+        (png_bytes_palette, "颜色类型"),
+        (png_bytes_gray_alpha, "颜色类型"),
+    ):
+        files = [("line", ("line.png", encoder(line), "image/png"))]
+        for idx, arr in enumerate(default_glyphs()):
+            files.append(("glyphs", (f"g{idx}.png", png_bytes(arr), "image/png")))
+        r = client.post("/recognize", files=files, data={"spec": json.dumps(default_spec())})
+        assert r.status_code == 400
+        assert needle in r.json()["detail"]
+
+
+def test_rejects_non_binary_pixel_values():
+    line = render_text("1")
+    files = [("line", ("line.png", png_bytes_nonbinary(line), "image/png"))]
+    for idx, arr in enumerate(default_glyphs()):
+        files.append(("glyphs", (f"g{idx}.png", png_bytes(arr), "image/png")))
+    r = client.post("/recognize", files=files, data={"spec": json.dumps(default_spec())})
     assert r.status_code == 400
-    assert "颜色类型" in r.json()["detail"]
+    assert "0/255" in r.json()["detail"]
 
 
-def test_rejects_gray_alpha_png():
-    tiles = tile_set()
-    files = [("images", (f"t{i}.png", png_bytes_gray_alpha(t), "image/png")) for i, t in enumerate(tiles)]
-    r = client.post("/align", files=files, data={"spec": json.dumps(spec_for([(0, 1), (1, 2)]))})
-    assert r.status_code == 400
-    assert "颜色类型" in r.json()["detail"]
-
-
-def test_rejects_non_png():
-    tiles = tile_set()
-    files = [("images", (f"t{i}.png", b"not a png", "image/png")) for i, _ in enumerate(tiles)]
-    r = client.post("/align", files=files, data={"spec": json.dumps(spec_for([(0, 1), (1, 2)]))})
+def test_rejects_non_png_and_bad_json():
+    files = [("line", ("line.png", b"not a png", "image/png"))]
+    for idx, arr in enumerate(default_glyphs()):
+        files.append(("glyphs", (f"g{idx}.png", png_bytes(arr), "image/png")))
+    r = client.post("/recognize", files=files, data={"spec": json.dumps(default_spec())})
     assert r.status_code == 400
 
-
-def test_rejects_oversize_image():
-    big = np.zeros((1025, 300), dtype=np.uint8)
-    tiles = [big, np.zeros((300, 300), dtype=np.uint8), np.zeros((300, 300), dtype=np.uint8)]
-    files = [("images", (f"t{i}.png", png_bytes(t), "image/png")) for i, t in enumerate(tiles)]
-    spec = {"pairs": [{"a": 0, "b": 1, "window": window((0, 0))}], "min_overlap_pixels": 10,
-            "max_mean_abs_diff": 1.0}
-    r = client.post("/align", files=files, data={"spec": json.dumps(spec)})
-    assert r.status_code == 400
-    assert "1024" in r.json()["detail"]
-
-
-def test_rejects_window_too_large():
-    tiles = tile_set()
-    spec = {
-        "pairs": [
-            {"a": 0, "b": 1, "window": {"dx_min": 0, "dx_max": 9, "dy_min": 0, "dy_max": 9}},
-            {"a": 1, "b": 2, "candidates": [[0, 0]]},
-        ],
-        "min_overlap_pixels": 1000,
-        "max_mean_abs_diff": 1.0,
-    }
-    r = post(tiles, spec)
-    assert r.status_code == 422
-
-
-def test_rejects_too_many_candidates():
-    tiles = tile_set()
-    spec = {
-        "pairs": [
-            {"a": 0, "b": 1, "candidates": [[i, 0] for i in range(82)]},
-            {"a": 1, "b": 2, "candidates": [[0, 0]]},
-        ],
-        "min_overlap_pixels": 1000,
-        "max_mean_abs_diff": 1.0,
-    }
-    assert post(tiles, spec).status_code == 422
-
-
-def test_rejects_unknown_image_index():
-    tiles = tile_set()
-    spec = {
-        "pairs": [{"a": 0, "b": 7, "candidates": [[0, 0]]}],
-        "min_overlap_pixels": 1000,
-        "max_mean_abs_diff": 1.0,
-    }
-    r = post(tiles, spec)
-    assert r.status_code == 422
-    assert "图号" in r.json()["detail"]
-
-
-def test_rejects_bad_spec_json():
-    tiles = tile_set()
+    line = render_text("1")
     r = client.post(
-        "/align",
-        files=[("images", (f"t{i}.png", png_bytes(t), "image/png")) for i, t in enumerate(tiles)],
-        data={"spec": "{not json"},
+        "/recognize",
+        files=[("line", ("line.png", png_bytes(line), "image/png"))]
+        + [
+            ("glyphs", (f"g{idx}.png", png_bytes(arr), "image/png"))
+            for idx, arr in enumerate(default_glyphs())
+        ],
+        data={"spec": "{broken"},
     )
     assert r.status_code == 400
 
 
-def test_rejects_duplicate_pair():
-    tiles = tile_set()
-    spec = {
-        "pairs": [
-            {"a": 0, "b": 1, "candidates": [[550, 0]]},
-            {"a": 0, "b": 1, "candidates": [[550, 0]]},
-        ],
-        "min_overlap_pixels": 1000,
-        "max_mean_abs_diff": 1.0,
-    }
-    assert post(tiles, spec).status_code == 422
+def test_rejects_label_count_mismatch():
+    line = render_text("1")
+    # Upload 11 glyph files but declare only 2 labels: order-wise correspondence
+    # is impossible, so this is a 422 semantic error.
+    spec = default_spec()
+    spec["glyph_labels"] = ["1", "2"]
+    r = post(line, default_glyphs(), spec=spec)
+    assert r.status_code == 422
+    assert "一一对应" in r.json()["detail"]
 
 
-def test_five_images_chain():
-    places = [(0, 0, 400, 400), (350, 0, 400, 400), (700, 0, 400, 400), (0, 350, 400, 400), (350, 350, 400, 400)]
-    tiles = tile_set(places=places)
-    offsets = {(0, 1): (350, 0), (1, 2): (350, 0), (0, 3): (0, 350), (3, 4): (350, 0)}
-    spec = {
-        "pairs": [
-            {"a": a, "b": b, "window": window(off, radius=2)} for (a, b), off in offsets.items()
-        ],
-        "min_overlap_pixels": 10000,
-        "max_mean_abs_diff": 2.0,
-    }
-    body = post(tiles, spec).json()
-    assert body["status"] == "aligned", body
-    assert [(p["x"], p["y"]) for p in body["positions"]] == [
-        (0, 0),
-        (350, 0),
-        (700, 0),
-        (0, 350),
-        (350, 350),
-    ]
+def test_rejects_illegal_label():
+    line = render_text("1")
+    # 11 uploads with 11 labels, but the first label is not a legal glyph label.
+    labels = ["x"] + [str(d) for d in range(10)]
+    glyphs = default_glyphs()
+    r = post(line, glyphs, labels=labels)
+    assert r.status_code == 422
+    assert "glyph_labels" in r.json()["detail"]
 
 
-def test_exposure_difference_within_threshold():
-    tiles = tile_set(
-        places=[(0, 0, 500, 500), (450, 0, 500, 500), (0, 450, 500, 500)],
-        per_tile_gain=[1.0, 1.04, 0.97],
-        offset=-2.0,
-        noise_sigma=0.8,
+def test_dot_only_label_set_yields_no_reading():
+    line = render_text("1")
+    r = post(
+        line,
+        [glyph_samples()["."]],
+        labels=["."],
+        spec={
+            "glyph_labels": ["."],
+            "max_mismatch": 5,
+            "min_margin": 1,
+        },
     )
-    # Single-position windows: the question here is whether a brightness
-    # mismatch is tolerated, not whether the window is narrow enough.
-    spec = {
-        "pairs": [
-            {"a": 0, "b": 1, "window": window((450, 0), radius=0)},
-            {"a": 0, "b": 2, "window": window((0, 450), radius=0)},
-        ],
-        "min_overlap_pixels": 10000,
-        "max_mean_abs_diff": 12.0,
-    }
-    body = post(tiles, spec).json()
-    assert body["status"] == "aligned", body
-    assert all(p["mean_abs_diff"] <= 12.0 for p in body["pairs"])
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "needs_review"
+    assert body["review_reasons"] == ["no_reading"]
 
 
-def test_ambiguous_always_names_an_uncertain_image_and_truncation_flag():
-    # Five constant tiles, four chained pairs, each free to slide over a 9x9
-    # window: enormous number of feasible layouts.  Enumeration is budgeted, so
-    # the answer must be "ambiguous" with truncation flagged and at least one
-    # named uncertain tile.
-    blank = np.full((200, 200), 90, dtype=np.uint8)
-    tiles = [blank.copy() for _ in range(5)]
-    spec = {
-        "pairs": [
-            {
-                "a": 0,
-                "b": 1,
-                "window": {"dx_min": 100, "dx_max": 108, "dy_min": 0, "dy_max": 8},
-            },
-            {
-                "a": 1,
-                "b": 2,
-                "window": {"dx_min": 100, "dx_max": 108, "dy_min": 0, "dy_max": 8},
-            },
-            {
-                "a": 2,
-                "b": 3,
-                "window": {"dx_min": 100, "dx_max": 108, "dy_min": 0, "dy_max": 8},
-            },
-            {
-                "a": 3,
-                "b": 4,
-                "window": {"dx_min": 100, "dx_max": 108, "dy_min": 0, "dy_max": 8},
-            },
-        ],
-        "min_overlap_pixels": 1000,
-        "max_mean_abs_diff": 0.0,
-    }
-    body = post(tiles, spec).json()
-    assert body["status"] == "ambiguous"
-    assert body["search_truncated"] is True
-    assert body["uncertain_image_ids"]
-    assert set(body["uncertain_image_ids"]) >= {4}
+def test_rejects_mismatched_heights():
+    line = render_text("1")
+    glyphs = default_glyphs()
+    glyphs[3] = np.concatenate([glyphs[3], np.full((1, glyphs[3].shape[1]), 255, np.uint8)], axis=0)
+    r = post(line, glyphs)
+    assert r.status_code == 422
+    assert "高度" in r.json()["detail"]
 
 
-def test_negative_coordinates_when_anchor_is_not_topleftmost():
-    # Tile 0 sits at the bottom-right of a 2x2 mosaic, so tiles 1 and 2 must get
-    # negative coordinates relative to it, and mosaic_bounds starts negative.
-    canvas = np.arange(0, 1, dtype=np.uint8)  # placeholder, replaced below
-    tiles = tile_set(places=[(450, 450, 600, 600), (0, 0, 600, 600), (0, 450, 600, 600)])
-    spec = {
-        "pairs": [
-            {"a": 0, "b": 1, "candidates": [[-450, -450]]},
-            {"a": 0, "b": 2, "candidates": [[-450, 0]]},
-        ],
-        "min_overlap_pixels": 20000,
-        "max_mean_abs_diff": 0.1,
-    }
-    body = post(tiles, spec).json()
-    assert body["status"] == "aligned", body
-    assert [(p["x"], p["y"]) for p in body["positions"]] == [(0, 0), (-450, -450), (-450, 0)]
-    bounds = body["mosaic_bounds"]
-    assert bounds["x_min"] == -450 and bounds["y_min"] == -450
-    assert bounds["width"] == 1050 and bounds["height"] == 1050
+def test_rejects_all_white_glyph():
+    line = render_text("1")
+    glyphs = default_glyphs()
+    glyphs[0] = np.full_like(glyphs[0], 255)
+    r = post(line, glyphs)
+    assert r.status_code == 422
+    assert "全白" in r.json()["detail"]
 
 
-def test_rescan_prefers_isolated_tile():
-    # Pairs (0,1) and (2,3) leave {2,3} stranded but mutually linked, while tile
-    # 4 has no declared pair at all.  The isolated tile is the better rescan
-    # target because adding one link cannot fix a stranded pair.
-    tiles = tile_set(places=DEFAULT_PLACES + [(600, 600, 300, 300), (700, 700, 300, 300)])
-    spec = {
-        "pairs": [
-            {"a": 0, "b": 1, "window": window((450, 0))},
-            {"a": 2, "b": 3, "window": window((-450, 450))},
-        ],
-        "min_overlap_pixels": 5000,
-        "max_mean_abs_diff": 4.0,
-    }
-    body = post(tiles, spec).json()
-    assert body["status"] == "disconnected"
-    assert body["unreachable_image_ids"] == [2, 3, 4]
-    assert body["rescan_image_id"] == 4
+def test_rejects_oversize_line():
+    line = np.full((HEIGHT, 200), 255, dtype=np.uint8)
+    r = post(line, default_glyphs())
+    assert r.status_code == 422
+    assert "192" in r.json()["detail"]
+
+
+def test_glyph_cap_boundary():
+    line = render_text("1")
+    # 33 uploads is the inclusive cap and must work; 34 is rejected.  The cap
+    # is enforced on the uploads with a 400 (a malformed request shape).
+    labels33 = (all_glyph_labels() * 3)[:33]
+    glyphs33 = [glyph_samples()[label] for label in labels33]
+    ok = post(line, glyphs33, labels=labels33)
+    assert ok.status_code == 200, ok.text
+
+    labels34 = (all_glyph_labels() * 4)[:34]
+    glyphs34 = [glyph_samples()[label] for label in labels34]
+    too_many = post(line, glyphs34, labels=labels34)
+    assert too_many.status_code in (400, 422)
+    assert "33" in too_many.json()["detail"]
+
+
+def test_min_margin_must_be_positive():
+    line = render_text("1")
+    r = post(line, default_glyphs(), spec=default_spec(min_margin=0))
+    assert r.status_code == 422
+
+
+def test_demo_endpoint_request_is_entry_ready():
+    line_bytes = client.get("/demo/line").content
+    glyph_bytes = [client.get(f"/demo/glyphs/{'dot' if l == '.' else l}").content for l in all_glyph_labels()]
+    spec = client.get("/demo/spec").json()
+    files = [("line", ("line.png", line_bytes, "image/png"))]
+    files += [("glyphs", (f"g{i}.png", data, "image/png")) for i, data in enumerate(glyph_bytes)]
+    r = client.post("/recognize", files=files, data={"spec": json.dumps(spec)})
+    body = r.json()
+    assert r.status_code == 200, r.text
+    assert body["status"] == "entry_ready", body
+    assert body["candidates"][0]["value"] == "12.5"
+
+
+def test_subset_of_labels_works():
+    # Only the glyphs actually appearing in the line are supplied.
+    line = render_text("1.0")
+    labels = ["0", "1", "."]
+    r = post(line, default_glyphs(labels), labels=labels)
+    body = r.json()
+    assert r.status_code == 200, r.text
+    assert body["status"] == "entry_ready"
+    assert body["candidates"][0]["raw_text"] == "1.0"

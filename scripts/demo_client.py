@@ -1,12 +1,10 @@
-"""In-process CLI: build demo tiles, POST them to a running service, print JSON.
-
-This is the no-Docker fallback for the demo:
+"""In-process CLI: build demo images, POST them to a running service, print JSON.
 
     uvicorn app.main:app --port 8000 &
     python scripts/demo_client.py --base-url http://localhost:8000
 
-It exercises the real HTTP surface (multipart upload + JSON spec), not the
-Python functions directly, and exits non-zero if the service does not answer.
+It exercises the real HTTP surface (multipart upload + JSON spec) and exits
+non-zero unless the service answers with status ``entry_ready``.
 """
 
 from __future__ import annotations
@@ -19,25 +17,30 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.demo_data import OFFSETS, demo_tiles, png_bytes, window  # noqa: E402
+from app.demo_font import all_glyph_labels, demo_line_png, demo_spec, glyph_png  # noqa: E402
 
 
-def build_multipart(tiles: list[bytes], spec: str) -> tuple[bytes, str]:
-    boundary = "----tilealigndemo"
-    parts: list[bytes] = []
-    for idx, data in enumerate(tiles):
+def build_multipart(line: bytes, glyphs: list[tuple[str, bytes]], spec: str):
+    boundary = "----dimensiondemo"
+    parts: list[bytes] = [
+        (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="line"; '
+            'filename="line.png"\r\nContent-Type: image/png\r\n\r\n'
+        ).encode()
+        + line
+        + b"\r\n"
+    ]
+    for name, data in glyphs:
         parts.append(
             (
-                f'--{boundary}\r\nContent-Disposition: form-data; name="images"; '
-                f'filename="tile{idx}.png"\r\nContent-Type: image/png\r\n\r\n'
+                f'--{boundary}\r\nContent-Disposition: form-data; name="glyphs"; '
+                f'filename="{name}"\r\nContent-Type: image/png\r\n\r\n'
             ).encode()
             + data
             + b"\r\n"
         )
     parts.append(
-        (
-            f'--{boundary}\r\nContent-Disposition: form-data; name="spec"\r\n\r\n{spec}\r\n'
-        ).encode()
+        (f"--{boundary}\r\nContent-Disposition: form-data; name=\"spec\"\r\n\r\n{spec}\r\n").encode()
     )
     parts.append(f"--{boundary}--\r\n".encode())
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
@@ -48,20 +51,14 @@ def main() -> int:
     parser.add_argument("--base-url", default="http://localhost:8000")
     args = parser.parse_args()
 
-    tiles = [png_bytes(t) for t in demo_tiles()]
-    spec = json.dumps(
-        {
-            "pairs": [
-                {"a": a, "b": b, "window": window(off, radius=2)}
-                for (a, b), off in OFFSETS.items()
-            ],
-            "min_overlap_pixels": 20000,
-            "max_mean_abs_diff": 3.0,
-        }
-    )
-    body, content_type = build_multipart(tiles, spec)
+    labels = all_glyph_labels()
+    glyphs = [
+        ("glyph_dot.png" if label == "." else f"glyph_{label}.png", glyph_png(label))
+        for label in labels
+    ]
+    body, content_type = build_multipart(demo_line_png(), glyphs, json.dumps(demo_spec()))
     req = urllib.request.Request(
-        f"{args.base_url.rstrip('/')}/align",
+        f"{args.base_url.rstrip('/')}/recognize",
         data=body,
         headers={"Content-Type": content_type},
         method="POST",
@@ -74,7 +71,7 @@ def main() -> int:
         return 2
 
     print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0 if payload.get("status") == "aligned" else 1
+    return 0 if payload.get("status") == "entry_ready" else 1
 
 
 if __name__ == "__main__":

@@ -1,10 +1,10 @@
 services:
-  align-api:
+  dimension-api:
     build:
       context: .
       dockerfile: Dockerfile
-    image: tile-align-api:1.0.0
-    container_name: tile-align-api
+    image: dimension-recognize-api:2.0.0
+    container_name: dimension-recognize-api
     ports:
       - "8000:8000"
     restart: unless-stopped

@@ -1,9 +1,9 @@
-"""Generate a demo tile set and a ready-to-send align request.
+"""Generate demo images and a ready-to-send recognize request.
 
-Writes ``demo/tileN.png`` (four overlapping crops of one synthetic drawing that
-form a 2x2 mosaic), ``demo/spec.json`` and ``demo/request.sh``.  The pair list
-includes the redundant cycle pair (0,3), so a unique answer requires the cycle
-to agree -- a good end-to-end check of the service.
+Writes ``demo/line.png``, ``demo/glyph_<label>.png`` (11 samples),
+``demo/spec.json`` and ``demo/request.sh``.  The demo line renders ``12.50``
+with two fused glyph boundaries and two flipped pixels, so recognition has a
+small, visible mismatch count.
 
 Usage:  python scripts/make_demo.py [outdir]
 """
@@ -16,34 +16,37 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.demo_data import OFFSETS, demo_tiles, png_bytes, window  # noqa: E402
+from app.demo_font import (  # noqa: E402
+    DEMO_TEXT,
+    all_glyph_labels,
+    demo_line_png,
+    demo_spec,
+    glyph_png,
+)
 
 
 def main(argv: list[str]) -> int:
     outdir = Path(argv[1] if len(argv) > 1 else "demo")
     outdir.mkdir(parents=True, exist_ok=True)
 
-    tiles = demo_tiles()
-    for idx, tile in enumerate(tiles):
-        (outdir / f"tile{idx}.png").write_bytes(png_bytes(tile))
+    (outdir / "line.png").write_bytes(demo_line_png())
+    for label in all_glyph_labels():
+        fname = "glyph_dot.png" if label == "." else f"glyph_{label}.png"
+        (outdir / fname).write_bytes(glyph_png(label))
 
-    spec = {
-        "pairs": [
-            {"a": a, "b": b, "window": window(off, radius=2)} for (a, b), off in OFFSETS.items()
-        ],
-        "min_overlap_pixels": 20000,
-        "max_mean_abs_diff": 3.0,
-    }
+    spec = demo_spec()
     (outdir / "spec.json").write_text(json.dumps(spec, indent=2), encoding="utf-8")
 
-    cmd = "curl -sS -X POST http://localhost:8000/align \\\n" + "".join(
-        f"  -F 'images=@{outdir}/tile{idx}.png;type=image/png' \\\n"
-        for idx in range(len(tiles))
-    )
+    cmd = "curl -sS -X POST http://localhost:8000/recognize \\\n"
+    cmd += f"  -F 'line=@{outdir}/line.png;type=image/png' \\\n"
+    for label in spec["glyph_labels"]:
+        fname = "glyph_dot.png" if label == "." else f"glyph_{label}.png"
+        cmd += f"  -F 'glyphs=@{outdir / fname};type=image/png' \\\n"
     cmd += f"  -F 'spec=<{outdir / 'spec.json'}'"
     (outdir / "request.sh").write_text(cmd + "\n", encoding="utf-8")
 
-    print(f"wrote {len(tiles)} tiles, spec.json and request.sh to {outdir}/")
+    print(f"wrote line.png (reading {DEMO_TEXT}), {len(spec['glyph_labels'])} glyphs,")
+    print(f"spec.json and request.sh to {outdir}/")
     print("start the service with:  docker compose up --build")
     print(f"then run:                bash {outdir}/request.sh")
     print("interactive docs:        http://localhost:8000/docs")

@@ -1,186 +1,70 @@
-"""Pydantic request/response models for the tile-alignment API."""
+"""Pydantic request/response models for the dimension recognition API."""
 
 from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
-MIN_IMAGES = 3
-MAX_IMAGES = 5
-MAX_IMAGE_SIDE = 1024
-MAX_WINDOW_POSITIONS = 81
-MAX_PAIRS = MAX_IMAGES * (MAX_IMAGES - 1) // 2
+MAX_GLYPHS = 33
+MAX_DIGITS = 8
+MAX_MISMATCH_LIMIT = 100_000
 
 
-class WindowSpec(BaseModel):
-    """Rectangular integer translation search window (inclusive bounds).
+class RecognizeSpec(BaseModel):
+    """Recognition metadata, sent as a JSON string in the multipart form.
 
-    The offset ``(dx, dy)`` is the position of image ``b``'s top-left corner in
-    image ``a``'s pixel coordinate frame.  A rectangular window must contain at
-    most 81 integer positions in total.
+    ``glyph_labels[i]`` is the label (``"0"``..``"9"`` or ``"."``) of the i-th
+    glyph upload, so labels follow upload order instead of file names.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    dx_min: StrictInt = Field(ge=-1_000_000, le=1_000_000)
-    dx_max: StrictInt = Field(ge=-1_000_000, le=1_000_000)
-    dy_min: StrictInt = Field(ge=-1_000_000, le=1_000_000)
-    dy_max: StrictInt = Field(ge=-1_000_000, le=1_000_000)
-
-    @model_validator(mode="after")
-    def _check_bounds(self) -> "WindowSpec":
-        if self.dx_min > self.dx_max or self.dy_min > self.dy_max:
-            raise ValueError("搜索窗的 min 不能大于 max")
-        count = (self.dx_max - self.dx_min + 1) * (self.dy_max - self.dy_min + 1)
-        if count > MAX_WINDOW_POSITIONS:
-            raise ValueError(
-                f"每个图对的搜索窗至多 {MAX_WINDOW_POSITIONS} 个位置，当前为 {count}"
-            )
-        return self
-
-    def positions(self) -> list[tuple[int, int]]:
-        return [
-            (dx, dy)
-            for dy in range(self.dy_min, self.dy_max + 1)
-            for dx in range(self.dx_min, self.dx_max + 1)
-        ]
+    glyph_labels: list[str] = Field(
+        min_length=1,
+        description="按上传顺序给出每张字样的标注，取值为 0~9 或 \".\"；长度须与字样图张数一致（至多 33）",
+    )
+    max_mismatch: StrictInt = Field(
+        ge=0,
+        le=MAX_MISMATCH_LIMIT,
+        description="允许录入的整行错点（像素不一致）总数上限",
+    )
+    min_margin: StrictInt = Field(
+        ge=1,
+        description="前两名不同数值错点数之差低于该正整数时转人工复核",
+    )
 
 
-class PairSpec(BaseModel):
-    """One declared overlapping image pair.
+class CharSpan(BaseModel):
+    """One recognized character and the columns it occupies on the line."""
 
-    ``a`` and ``b`` are zero-based upload indices.  ``window`` and
-    ``candidates`` are mutually exclusive ways to describe the search space.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    a: StrictInt = Field(ge=0)
-    b: StrictInt = Field(ge=0)
-    window: WindowSpec | None = None
-    candidates: list[tuple[StrictInt, StrictInt]] | None = None
-
-    @model_validator(mode="after")
-    def _check_pair(self) -> "PairSpec":
-        if self.a == self.b:
-            raise ValueError("图对的两张图不能相同")
-        if (self.window is None) == (self.candidates is None):
-            raise ValueError("每个图对必须且只能给出 window 或 candidates 之一")
-        if self.candidates is not None:
-            if not (1 <= len(self.candidates) <= MAX_WINDOW_POSITIONS):
-                raise ValueError(
-                    f"candidates 数量必须在 1 到 {MAX_WINDOW_POSITIONS} 之间"
-                )
-        return self
-
-    def offsets(self) -> list[tuple[int, int]]:
-        """Return search offsets, de-duplicated, preserving input order."""
-        raw = self.candidates if self.candidates is not None else self.window.positions()
-        seen: set[tuple[int, int]] = set()
-        result: list[tuple[int, int]] = []
-        for dx, dy in raw:
-            key = (int(dx), int(dy))
-            if key not in seen:
-                seen.add(key)
-                result.append(key)
-        return result
+    char: Literal["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "."]
+    start_col: StrictInt = Field(ge=0, description="起始列（含，0 起）")
+    end_col: StrictInt = Field(ge=1, description="结束列（不含），宽度 = end_col - start_col")
+    mismatches: StrictInt = Field(ge=0, description="该字符与等宽字样比对的错点数")
 
 
-class AlignSpec(BaseModel):
-    """Shared alignment request metadata (sent as a JSON string in the form)."""
+class Reading(BaseModel):
+    """One distinct numeric reading, with its cheapest spelling/segmentation."""
 
-    model_config = ConfigDict(extra="forbid")
-
-    pairs: list[PairSpec] = Field(default_factory=list, max_length=MAX_PAIRS)
-    min_overlap_pixels: StrictInt = Field(ge=1, le=MAX_IMAGE_SIDE * MAX_IMAGE_SIDE)
-    max_mean_abs_diff: float = Field(ge=0, le=255, allow_inf_nan=False)
-
-    @model_validator(mode="after")
-    def _check_pairs(self) -> "AlignSpec":
-        seen: set[tuple[int, int]] = set()
-        for pair in self.pairs:
-            key = (min(pair.a, pair.b), max(pair.a, pair.b))
-            if key in seen:
-                raise ValueError(f"图对 {key} 被重复声明")
-            seen.add(key)
-        return self
+    value: str = Field(description="规范化数值（去前导零、保留小数点与末尾零），如 12.50 -> 12.5")
+    raw_text: str = Field(description="识别原文，含小数点与前导/末尾零，如 \"012.50\"")
+    mismatches: StrictInt = Field(ge=0, description="整行错点总数（各字符错点之和）")
+    chars: list[CharSpan] = Field(description="按原文顺序给出各字符的列范围与错点")
 
 
-# ---------------------------------------------------------------------------
-# Responses
-# ---------------------------------------------------------------------------
-
-
-class ImageInfo(BaseModel):
-    image_id: int
-    width: int
-    height: int
-
-
-class ImagePosition(BaseModel):
-    image_id: int
-    x: int
-    y: int
-
-
-class PairResult(BaseModel):
-    pair_id: int
-    a: int
-    b: int
-    dx: int
-    dy: int
-    overlap_pixels: int = Field(description="重叠像素数（达标时必 ≥ min_overlap_pixels）")
-    mean_abs_diff: float = Field(description="重叠区平均绝对灰度差（达标时 ≤ max_mean_abs_diff）")
-
-
-class PairFailure(BaseModel):
-    pair_id: int
-    a: int
-    b: int
-    reason: Literal["insufficient_overlap", "mean_abs_diff_too_high"]
-    max_overlap_pixels: int
-    best_mean_abs_diff: float | None = None
-
-
-class MosaicBounds(BaseModel):
-    x_min: int
-    y_min: int
-    x_max: int
-    y_max: int
-    width: int
-    height: int
-
-
-class AlignResponse(BaseModel):
-    status: Literal["aligned", "disconnected", "no_solution", "ambiguous"]
-    layout_unique: bool
+class RecognizeResponse(BaseModel):
+    status: Literal["entry_ready", "needs_review"]
     message: str
-    images: list[ImageInfo]
-    positions: list[ImagePosition] | None = Field(
-        default=None,
-        description="仅 status=aligned 时给出；按图号排列，坐标为图左上角，单位像素",
+    review_reasons: list[
+        Literal["no_reading", "mismatch_limit_exceeded", "margin_too_small", "search_truncated"]
+    ] = Field(default_factory=list, description="status=needs_review 时的原因（可多个）")
+    line_width: StrictInt = Field(ge=1)
+    line_height: StrictInt = Field(ge=1)
+    max_mismatch: StrictInt
+    min_margin: StrictInt
+    candidates: list[Reading] = Field(
+        default_factory=list,
+        description="错点最少的至多两个不同数值，按错点数升序、平局按原文确定性排序",
     )
-    pairs: list[PairResult] | None = None
-    mosaic_bounds: MosaicBounds | None = Field(
-        default=None, description="拼接后所有图块的外接矩形（以首图左上角为原点）"
-    )
-    pair_candidate_counts: list[int] | None = Field(
-        default=None, description="每个声明图对在搜索窗内达标的平移个数"
-    )
-    failing_pairs: list[PairFailure] | None = Field(
-        default=None, description="status=no_solution 时给出未达标的图对"
-    )
-    unreachable_image_ids: list[int] | None = None
-    rescan_image_id: int | None = Field(
-        default=None, description="status=disconnected 时建议补扫的一块（上传序号）"
-    )
-    uncertain_image_ids: list[int] | None = Field(
-        default=None, description="status=ambiguous 时位置不确定的图块"
-    )
-    alternative_layouts: list[list[ImagePosition]] | None = Field(
-        default=None, description="status=ambiguous 时给出的两组（或多组）可行位置方案"
-    )
-    search_truncated: bool = Field(
-        default=False, description="候选组合数达到搜索上限时为 true，唯一性未获证明"
-    )
+    search_truncated: bool = False
